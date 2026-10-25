@@ -51,8 +51,9 @@ docker build -t openjarvis-coding-crew:local \
 
 The tool runs it with `--pull never`: it only ever uses the image you built, never one pulled
 from a registry. Pin `KIT_REF` so the agents' instructions can't change without a rebuild.
-Other build arguments: `CLAUDE_CODE_VERSION`, `KIT_REPO`, `KIT_MARKETPLACE_NAME` and
-`KIT_PLUGINS` (the core plus the Node, React and Python packs). For other stacks, build an
+Other build arguments: `CLAUDE_CODE_VERSION`, `KIT_REPO`, `KIT_MARKETPLACE_NAME`,
+`KIT_PLUGINS` (the core plus the Node, React and Python packs) and `KIT_LANGUAGE` (the
+language the agents write commits and pull requests in, e.g. `Español`). For other stacks, build an
 image `FROM openjarvis-coding-crew:local` that adds the toolchain (`dotnet`, a JDK…) and
 installs the pack.
 

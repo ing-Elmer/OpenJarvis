@@ -17,6 +17,9 @@ ARG KIT_REPO=https://github.com/ing-Elmer/cuadrilla.git
 ARG KIT_REF=main
 ARG KIT_MARKETPLACE_NAME=cuadrilla
 ARG KIT_PLUGINS="cuadrilla cuadrilla-node-typescript cuadrilla-react cuadrilla-python-fastapi"
+# The kit's core plugin takes the language the agents write in (answers, commits, PR text).
+ARG KIT_CORE_PLUGIN=cuadrilla
+ARG KIT_LANGUAGE=English
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl git jq python3 python3-venv && \
@@ -38,6 +41,12 @@ USER crew
 WORKDIR /work
 
 RUN claude plugin marketplace add /opt/kit && \
-    for plugin in ${KIT_PLUGINS}; do claude plugin install "${plugin}@${KIT_MARKETPLACE_NAME}" || exit 1; done
+    for plugin in ${KIT_PLUGINS}; do \
+      if [ "${plugin}" = "${KIT_CORE_PLUGIN}" ]; then \
+        claude plugin install "${plugin}@${KIT_MARKETPLACE_NAME}" --config "response_language=${KIT_LANGUAGE}" || exit 1; \
+      else \
+        claude plugin install "${plugin}@${KIT_MARKETPLACE_NAME}" || exit 1; \
+      fi; \
+    done
 
 ENTRYPOINT ["/usr/local/bin/crew-run"]
