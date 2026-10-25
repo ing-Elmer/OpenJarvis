@@ -587,3 +587,289 @@ def _short_timeout(real_run):
         return real_run(cmd, *args, **kwargs)
 
     return run
+
+
+# ---------------------------------------------------------------------------
+# Jira as the source of tickets
+# ---------------------------------------------------------------------------
+
+TRUSTED = "712020:owner"
+JIRA_TOKEN = "jira-secret-token-value"
+
+
+@pytest.fixture()
+def jira(crew, monkeypatch):
+    import base64
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    def ticket(summary, labels, status="Por hacer", category="new"):
+        return {
+            "summary": summary,
+            "labels": labels,
+            "created": "2026-10-24T10:00:00.000+0000",
+            "status": {"name": status, "statusCategory": {"key": category}},
+            "issuetype": {"name": "Subtarea"},
+            "description": {
+                "type": "doc",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": f"Do: {summary}"}],
+                    }
+                ],
+            },
+            "comment": {"comments": []},
+        }
+
+    state = {
+        "issues": {
+            "SCRUM-68": ticket(
+                "/health returns the version", ["backend", "agent-ready"]
+            ),
+            "SCRUM-69": ticket("Labelled by a stranger", ["agent-ready"]),
+            "SCRUM-70": ticket("Claimed", ["agent-ready", "agent-working"]),
+            "SCRUM-71": ticket("Finished", ["agent-ready"], "Hecho", "done"),
+            "OTHER-1": ticket("Other project", ["agent-ready"]),
+        },
+        "labeled_by": {
+            "SCRUM-68": [
+                ("712020:stranger", "", "agent-ready"),  # removed later, then re-added
+                (TRUSTED, "agent-ready", ""),
+                (TRUSTED, "backend", "agent-ready backend"),
+            ],
+            "SCRUM-69": [
+                (TRUSTED, "", "backend"),
+                ("712020:stranger", "", "agent-ready"),
+            ],
+        },
+        "requests": [],
+        "comments": [],
+    }
+    expected = "Basic " + base64.b64encode(f"me@x.com:{JIRA_TOKEN}".encode()).decode()
+    transitions = [
+        {"id": "21", "name": "Iniciar", "to": {"name": "En curso"}},
+        {"id": "31", "name": "Revisar", "to": {"name": "En revisión"}},
+        {"id": "11", "name": "Reabrir", "to": {"name": "Por hacer"}},
+    ]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _reply(self, code, body=None):
+            data = json.dumps(body).encode() if body is not None else b""
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _handle(self, method):
+            url = urlparse(self.path)
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length)) if length else None
+            state["requests"].append((method, url.path, body))
+            if self.headers.get("Authorization") != expected:
+                return self._reply(401, {"errorMessages": ["unauthorized"]})
+            parts = url.path.split("/")
+            if method == "POST" and url.path == "/rest/api/3/search/jql":
+                jql = body["jql"]
+                found = [
+                    {"key": key, "fields": fields}
+                    for key, fields in state["issues"].items()
+                    if key.split("-")[0] in jql
+                    and "agent-ready" in fields["labels"]
+                    and fields["status"]["statusCategory"]["key"] != "done"
+                ]
+                return self._reply(200, {"issues": found})
+            key = parts[5] if len(parts) > 5 else ""
+            issue = state["issues"].get(key)
+            if issue is None:
+                return self._reply(404, {"errorMessages": ["not found"]})
+            tail = parts[6] if len(parts) > 6 else ""
+            if method == "GET" and not tail:
+                return self._reply(200, {"key": key, "fields": issue})
+            if method == "GET" and tail == "changelog":
+                start = int(parse_qs(url.query).get("startAt", ["0"])[0])
+                history = [
+                    {
+                        "author": {"accountId": who},
+                        "items": [
+                            {"field": "labels", "fromString": old, "toString": new}
+                        ],
+                    }
+                    for who, old, new in state["labeled_by"].get(key, [])
+                ]
+                page = history[start : start + 2]  # small pages exercise pagination
+                return self._reply(
+                    200, {"values": page, "isLast": start + 2 >= len(history)}
+                )
+            if method == "PUT" and not tail:
+                for op in body["update"]["labels"]:
+                    if "add" in op and op["add"] not in issue["labels"]:
+                        issue["labels"].append(op["add"])
+                    if "remove" in op and op["remove"] in issue["labels"]:
+                        issue["labels"].remove(op["remove"])
+                return self._reply(204)
+            if method == "GET" and tail == "transitions":
+                return self._reply(200, {"transitions": transitions})
+            if method == "POST" and tail == "transitions":
+                chosen = next(
+                    t for t in transitions if t["id"] == body["transition"]["id"]
+                )
+                issue["status"]["name"] = chosen["to"]["name"]
+                return self._reply(204)
+            if method == "POST" and tail == "comment":
+                state["comments"].append((key, body["body"]))
+                return self._reply(201, {"id": "1"})
+            return self._reply(400, {"errorMessages": ["unexpected"]})
+
+        def do_GET(self):
+            self._handle("GET")
+
+        def do_POST(self):
+            self._handle("POST")
+
+        def do_PUT(self):
+            self._handle("PUT")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("JIRA_EMAIL", "me@x.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", JIRA_TOKEN)
+    monkeypatch.setenv("FAKE_MODE", "jira")
+    for key, value in {
+        "source": "jira",
+        "jira_url": f"http://127.0.0.1:{server.server_address[1]}",
+        "jira_projects": "SCRUM=acme/app",
+        "jira_trusted_accounts": TRUSTED,
+        "jira_status_working": "En curso",
+        "jira_status_review": "En revisión",
+        "jira_status_failed": "Por hacer",
+    }.items():
+        setattr(crew.config, key, value)
+    crew.jira = state
+    yield crew
+    server.shutdown()
+
+
+def _comment_text(adf):
+    return coding_crew._adf_text(adf)
+
+
+class TestJira:
+    def test_queue_lists_ready_unclaimed_tickets_of_mapped_projects(self, jira):
+        result = CodingCrewQueueTool(config=jira.config).execute()
+        data = json.loads(result.content)
+        assert result.success
+        assert [item["ref"] for item in data["ready"]] == ["SCRUM-68", "SCRUM-69"]
+        jql = next(r[2]["jql"] for r in jira.jira["requests"] if r[0] == "POST")
+        assert "project in (SCRUM)" in jql and 'labels = "agent-ready"' in jql
+
+    def test_runs_a_ticket_end_to_end(self, jira):
+        result, data = jira.run("SCRUM-68")
+        assert data["outcome"] == "pr", data
+        assert data["branches"] == ["agent/SCRUM-68-health-version"]
+        assert "agent/SCRUM-68-health-version" in jira.remote_branches()
+        issue = jira.jira["issues"]["SCRUM-68"]
+        assert issue["status"]["name"] == "En revisión"
+        assert "agent-done" in issue["labels"]
+        assert "agent-ready" not in issue["labels"]
+        assert "agent-working" not in issue["labels"]
+        key, adf = jira.jira["comments"][-1]
+        assert key == "SCRUM-68" and data["pr_url"] in _comment_text(adf)
+        links = [
+            m["attrs"]["href"]
+            for p in adf["content"]
+            for c in p["content"]
+            for m in c.get("marks", [])
+        ]
+        assert links == [data["pr_url"]]
+        # the agent got the ticket as a file and the prompt points to it
+        log = jira.container_log()
+        assert "ticket: # SCRUM-68: /health returns the version" in log
+        assert "/out/ticket.md" in log
+        # the PR is titled with the key and links back to Jira
+        create = next(c for c in jira.gh_calls() if c["args"][:2] == ["pr", "create"])
+        assert create["args"][create["args"].index("--title") + 1].startswith(
+            "SCRUM-68: /health returns the version"
+        )
+        assert f"{jira.config.jira_url}/browse/SCRUM-68" in create["stdin"]
+        # claimed (label + In progress) before the container ran
+        moves = [
+            r[2]["transition"]["id"]
+            for r in jira.jira["requests"]
+            if r[0] == "POST" and r[1].endswith("/transitions")
+        ]
+        assert moves == ["21", "31"]
+
+    def test_jira_and_github_secrets_never_reach_the_container(self, jira):
+        jira.run("SCRUM-68")
+        call = jira.docker_calls()[0]
+        assert JIRA_TOKEN not in json.dumps(call["args"])
+        assert "JIRA_API_TOKEN" not in call["args"]
+        assert call["env"]["GH_TOKEN"] == READ_TOKEN
+
+    def test_refuses_a_ticket_labelled_by_an_untrusted_account(self, jira):
+        result, data = jira.run("SCRUM-69")
+        assert data["outcome"] == "untrusted"
+        assert jira.docker_calls() == []
+        issue = jira.jira["issues"]["SCRUM-69"]
+        assert "agent-failed" in issue["labels"]
+        assert "agent-ready" not in issue["labels"]
+        assert "does not trust" in _comment_text(jira.jira["comments"][-1][1])
+
+    @pytest.mark.parametrize(
+        ("ref", "outcome"),
+        [
+            ("SCRUM-70", "not-ready"),
+            ("SCRUM-71", "not-ready"),
+            ("OTHER-1", "not-allowed"),
+            ("acme/app#12", "invalid"),
+        ],
+    )
+    def test_refuses_what_is_not_ready_or_allowed(self, jira, ref, outcome):
+        _, data = jira.run(ref)
+        assert data["outcome"] == outcome
+        assert jira.docker_calls() == []
+
+    def test_a_failed_run_goes_back_to_to_do(self, jira, monkeypatch):
+        monkeypatch.setenv("FAKE_MODE", "nochange")
+        _, data = jira.run("SCRUM-68")
+        assert data["outcome"] == "no-changes"
+        issue = jira.jira["issues"]["SCRUM-68"]
+        assert issue["status"]["name"] == "Por hacer"
+        assert "agent-failed" in issue["labels"]
+        assert "agent-working" not in issue["labels"]
+
+    def test_needs_jira_credentials_and_trusted_accounts(self, jira, monkeypatch):
+        monkeypatch.delenv("JIRA_API_TOKEN")
+        _, data = jira.run("SCRUM-68")
+        assert data["outcome"] == "not-configured"
+        monkeypatch.setenv("JIRA_API_TOKEN", JIRA_TOKEN)
+        _, data = jira.run("SCRUM-68", jira_trusted_accounts="")
+        assert data["outcome"] == "not-configured"
+
+    def test_a_wrong_token_is_reported_without_leaking_it(self, jira, monkeypatch):
+        monkeypatch.setenv("JIRA_API_TOKEN", "wrong")
+        result, data = jira.run("SCRUM-68")
+        assert data["outcome"] == "error" and "401" in data["message"]
+        assert "wrong" not in result.content
+
+
+def test_jira_settings_are_validated():
+    settings = load_settings(
+        CodingCrewConfig(
+            source="jira",
+            jira_url="http://evil.example",
+            jira_projects="SCRUM=acme/app, bad=acme/x, OK=../evil",
+            env_passthrough="ANTHROPIC_API_KEY,JIRA_API_TOKEN,MY_JIRA",
+            jira_token_env="MY_JIRA",
+        )
+    )
+    assert settings.source == "jira"
+    assert settings.jira_url == ""
+    assert settings.jira_projects == {"SCRUM": "acme/app"}
+    assert settings.env_passthrough == ["ANTHROPIC_API_KEY"]

@@ -22,6 +22,13 @@ case "${FAKE_MODE}" in
     git switch -q -c feature/not-agent
     echo "x" > x.txt && git add x.txt && git commit -q -m "x"
     ok 0.5 4 ;;
+  jira)
+    echo "ticket: $(head -n 1 "${CREW_OUT}/ticket.md" 2>/dev/null)" >> "$FAKE_LOG"
+    git switch -q -c "agent/${CREW_ISSUE}-health-version"
+    echo "version" > version.txt
+    git add version.txt && git commit -q -m "feat: version in /health"
+    printf '## Summary\nAdds the version.\n' > "${CREW_OUT}/pr-body.md"
+    ok 0.8 9 ;;
   nochange) ok 0.4 3 ;;
   budget) echo '{"type":"result","subtype":"error_max_budget_usd","is_error":true,"total_cost_usd":5.1,"num_turns":30,"errors":["Reached maximum budget ($5)"]}' ;;
   garbage) echo "segfault" ;;

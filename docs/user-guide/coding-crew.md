@@ -52,7 +52,8 @@ docker build -t openjarvis-coding-crew:local \
 The tool runs it with `--pull never`: it only ever uses the image you built, never one pulled
 from a registry. Pin `KIT_REF` so the agents' instructions can't change without a rebuild.
 Other build arguments: `CLAUDE_CODE_VERSION`, `KIT_REPO`, `KIT_MARKETPLACE_NAME`,
-`KIT_PLUGINS` (the core plus the Node, React and Python packs) and `KIT_LANGUAGE` (the
+`KIT_PLUGINS` (the core plus the Node, React and Python packs; empty to use only the
+repository's own `.claude/`), `UV_VERSION`, `PYTHON_VERSIONS` and `KIT_LANGUAGE` (the
 language the agents write commits and pull requests in, e.g. `Español`). For other stacks, build an
 image `FROM openjarvis-coding-crew:local` that adds the toolchain (`dotnet`, a JDK…) and
 installs the pack.
@@ -104,6 +105,42 @@ timeout_minutes = 45
 | `memory`, `cpus` | `4g`, `2` | Container limits (also `--pids-limit 1024`). |
 | `max_bundle_mb` | `200` | Larger results are refused. |
 | `comment` | `true` | Comment the outcome on the issue. |
+
+### Tickets from Jira
+
+With `source = "jira"` the crew takes Jira tickets instead of GitHub issues; the code and the
+pull requests stay on GitHub.
+
+```toml
+[tools.coding_crew]
+source = "jira"
+jira_url = "https://your-site.atlassian.net"
+jira_projects = "PROJ=your-user/your-app"     # Jira project key = GitHub repository
+jira_trusted_accounts = "712020:…"            # account IDs that may hand tickets to the crew
+jira_status_working = "In Progress"           # your workflow's status names
+jira_status_review = "In Review"
+jira_status_failed = "To Do"
+```
+
+```bash
+export JIRA_EMAIL=you@example.com
+export JIRA_API_TOKEN=...      # https://id.atlassian.com/manage-profile/security/api-tokens
+```
+
+- The **Jira token stays on the host**, like the GitHub login. The host reads the ticket and
+  writes its text (description and comments) to `/out/ticket.md`; the agent reads that file.
+  `jira_prompt` is what the agent is asked (`{key}`, `{ticket_file}` and `{repo}` are replaced).
+- **Trusted start**: the account that last added the ready label (from the ticket's history)
+  must be in `jira_trusted_accounts`. Find your account ID in your Jira profile URL.
+- **States**: claimed → `agent-working` label and *In Progress*; draft PR → `agent-done`,
+  *In Review* and a comment with the link; failure → `agent-failed`, back to *To Do* and a
+  comment with the reason. A status your workflow can't reach from the current one is skipped.
+- The queue is `project in (…) AND labels = "agent-ready" AND statusCategory != Done`, oldest
+  first, skipping tickets with any crew label. `jira_projects` is the allowlist: `repos` is
+  only used for GitHub issues.
+- To use the agents and rules the repository ships in its own `.claude/` instead of a kit,
+  build the image with `--build-arg KIT_PLUGINS=""`. The image includes `uv` and Python 3.12
+  and 3.13 for Python projects.
 
 ### 4. Activate the operator
 

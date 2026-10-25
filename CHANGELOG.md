@@ -21,7 +21,11 @@ write to GitHub ever enters the container: the agent's commits come back as a
 git bundle that the host imports into a fresh repository and pushes with its
 own `gh` login. Only issues labelled by someone with write access are run, the
 image is local-only (`--pull never`), and public comments carry fixed messages
-only. Configure it under `[tools.coding_crew]`; see
+only. Tickets can also come from Jira (`source = "jira"`): the host reads the
+ticket with the Jira API, hands it to the agent as a file, moves it to In
+Progress / In Review (or back to To Do) and comments the PR link; the Jira token
+stays on the host too, and only accounts in `jira_trusted_accounts` can start a
+run. Configure it under `[tools.coding_crew]`; see
 `docs/user-guide/coding-crew.md`.
 
 **Apple Foundation Models (AFM 3)** — a new in-process `afm` engine drives

@@ -1,4 +1,5 @@
-# Coding crew image: a disposable environment where a coding agent solves one GitHub issue.
+# Coding crew image: a disposable environment where a coding agent solves one ticket
+# (a GitHub issue or a Jira ticket).
 # Used by the coding_crew_run tool (docs/user-guide/coding-crew.md). It holds no credentials,
 # and no token that can write to GitHub is ever passed to it: the host pushes the result.
 #
@@ -16,10 +17,14 @@ ARG CLAUDE_CODE_VERSION=2.1.310
 ARG KIT_REPO=https://github.com/ing-Elmer/cuadrilla.git
 ARG KIT_REF=main
 ARG KIT_MARKETPLACE_NAME=cuadrilla
+# Leave KIT_PLUGINS empty to use only the agents and rules the repository itself ships in .claude/.
 ARG KIT_PLUGINS="cuadrilla cuadrilla-node-typescript cuadrilla-react cuadrilla-python-fastapi"
 # The kit's core plugin takes the language the agents write in (answers, commits, PR text).
 ARG KIT_CORE_PLUGIN=cuadrilla
 ARG KIT_LANGUAGE=English
+# Python projects: uv, plus the Python versions it should have ready (more are fetched on demand).
+ARG UV_VERSION=0.9.30
+ARG PYTHON_VERSIONS="3.12 3.13"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl git jq python3 python3-venv && \
@@ -30,17 +35,25 @@ RUN apt-get update && \
 
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && npm cache clean --force
 
+RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-$(uname -m)-unknown-linux-gnu.tar.gz" \
+      | tar -xz --strip-components=1 -C /usr/local/bin && \
+    uv --version
+
 # The kit is fetched once, at the pinned ref, and owned by root: the agent can read it, not change it.
-RUN git clone --quiet "${KIT_REPO}" /opt/kit && \
-    git -C /opt/kit checkout --quiet "${KIT_REF}" && \
-    rm -rf /opt/kit/.git
+RUN if [ -n "${KIT_PLUGINS}" ]; then \
+      git clone --quiet "${KIT_REPO}" /opt/kit && \
+      git -C /opt/kit checkout --quiet "${KIT_REF}" && \
+      rm -rf /opt/kit/.git; \
+    fi
 
 RUN useradd --create-home --shell /bin/bash crew && mkdir -p /work /out && chown crew:crew /work
 COPY --chown=root:root --chmod=0755 crew-run.sh /usr/local/bin/crew-run
 USER crew
 WORKDIR /work
 
-RUN claude plugin marketplace add /opt/kit && \
+RUN if [ -n "${PYTHON_VERSIONS}" ]; then uv python install ${PYTHON_VERSIONS}; fi
+
+RUN [ -z "${KIT_PLUGINS}" ] || claude plugin marketplace add /opt/kit || exit 1; \
     for plugin in ${KIT_PLUGINS}; do \
       if [ "${plugin}" = "${KIT_CORE_PLUGIN}" ]; then \
         claude plugin install "${plugin}@${KIT_MARKETPLACE_NAME}" --config "response_language=${KIT_LANGUAGE}" || exit 1; \

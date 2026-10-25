@@ -1151,6 +1151,24 @@ class CodingCrewConfig:
     docker_bin: str = "docker"
     gh_bin: str = "gh"
     git_bin: str = "git"
+    # Where the tasks come from: "github" (issues in `repos`) or "jira".
+    source: str = "github"
+    jira_url: str = ""  # e.g. "https://your-site.atlassian.net"
+    jira_projects: str = ""  # "PROJ=owner/repo,OTHER=owner/other"
+    # Account IDs allowed to hand a ticket to the crew (who added the ready label).
+    jira_trusted_accounts: str = ""
+    jira_email_env: str = "JIRA_EMAIL"  # names of host-only variables
+    jira_token_env: str = "JIRA_API_TOKEN"
+    jira_status_working: str = "In Progress"  # statuses to move to; "" = don't move
+    jira_status_review: str = "In Review"
+    jira_status_failed: str = "To Do"
+    jira_prompt: str = (
+        "Implement Jira ticket {key}. Its full text is in {ticket_file}; "
+        "Jira itself is not reachable from here. Follow the project's own rules "
+        "and agents (CLAUDE.md, .claude/), verify every acceptance criterion "
+        "with the project's checks, and report the result of each criterion "
+        "in the pull request description."
+    )
 
 
 @dataclass(slots=True)
@@ -2366,6 +2384,10 @@ enabled = true
 # prompt = "/cuadrilla:ticket #{{issue}}"
 # budget_usd = 5.0
 # timeout_minutes = 45
+# source = "jira"                # tickets from Jira instead of GitHub issues
+# jira_url = "https://your-site.atlassian.net"
+# jira_projects = "PROJ=owner/repo"
+# jira_trusted_accounts = "<your Jira account id>"
 
 [server]
 # Loopback is safe for local use and works without API authentication.

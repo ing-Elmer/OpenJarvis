@@ -33,6 +33,7 @@ Trust boundaries:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -41,6 +42,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -61,7 +64,15 @@ _BRANCH_CHARS = re.compile(r"^[A-Za-z0-9._/-]{1,120}$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _RESULT_MARKER = "CREW_RESULT "
 # Names that must never reach the container: they would let the agent write to GitHub.
-_WRITE_TOKENS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_PAT"}
+_WRITE_TOKENS = {
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_PAT",
+    "JIRA_API_TOKEN",
+    "ATLASSIAN_API_TOKEN",
+}
+_JIRA_KEY = re.compile(r"^\s*([A-Z][A-Z0-9_]{0,9})-(\d{1,7})\s*$")
 _MAX_BODY_CHARS = 60_000
 _run_lock = threading.Lock()
 
@@ -115,6 +126,16 @@ class CrewSettings:
     docker_bin: str
     gh_bin: str
     git_bin: str
+    source: str
+    jira_url: str
+    jira_projects: Dict[str, str]
+    jira_trusted_accounts: List[str]
+    jira_email_env: str
+    jira_token_env: str
+    jira_status_working: str
+    jira_status_review: str
+    jira_status_failed: str
+    jira_prompt: str
 
 
 def _split(value: Any) -> List[str]:
@@ -153,6 +174,28 @@ def load_settings(config: Any = None) -> CrewSettings:
         elif _ENV_NAME.match(name):
             passthrough.append(name)
     read_token_env = str(get("read_token_env", "GH_READ_TOKEN") or "")
+    jira_projects: Dict[str, str] = {}
+    for pair in _split(get("jira_projects", "")):
+        key, _, repo = pair.partition("=")
+        if re.match(r"^[A-Z][A-Z0-9_]{0,9}$", key.strip()) and _REPO.match(
+            repo.strip()
+        ):
+            jira_projects[key.strip()] = repo.strip()
+    jira_url = str(get("jira_url", "") or "").rstrip("/")
+    if not re.match(
+        r"^(https://[A-Za-z0-9.-]+|http://(127\.0\.0\.1|localhost)(:\d+)?)$", jira_url
+    ):
+        jira_url = ""
+    env_name = lambda value, default: (  # noqa: E731
+        str(value) if _ENV_NAME.match(str(value or "")) else default
+    )
+    jira_secrets = {
+        env_name(get("jira_email_env", "JIRA_EMAIL"), "JIRA_EMAIL"),
+        env_name(get("jira_token_env", "JIRA_API_TOKEN"), "JIRA_API_TOKEN"),
+    }
+    passthrough = [name for name in passthrough if name not in jira_secrets]
+    if read_token_env in jira_secrets:
+        read_token_env = ""
     prefix = str(get("branch_prefix", "agent/"))
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*/$", prefix):
         prefix = "agent/"
@@ -183,6 +226,23 @@ def load_settings(config: Any = None) -> CrewSettings:
         docker_bin=str(get("docker_bin", "docker")),
         gh_bin=str(get("gh_bin", "gh")),
         git_bin=str(get("git_bin", "git")),
+        source="jira" if str(get("source", "github")).lower() == "jira" else "github",
+        jira_url=jira_url,
+        jira_projects=jira_projects,
+        jira_trusted_accounts=_split(get("jira_trusted_accounts", "")),
+        jira_email_env=env_name(get("jira_email_env", "JIRA_EMAIL"), "JIRA_EMAIL"),
+        jira_token_env=env_name(
+            get("jira_token_env", "JIRA_API_TOKEN"), "JIRA_API_TOKEN"
+        ),
+        jira_status_working=str(get("jira_status_working", "In Progress") or ""),
+        jira_status_review=str(get("jira_status_review", "In Review") or ""),
+        jira_status_failed=str(get("jira_status_failed", "To Do") or ""),
+        jira_prompt=str(
+            get(
+                "jira_prompt",
+                "Implement Jira ticket {key}. Its full text is in {ticket_file}.",
+            )
+        ),
     )
 
 
@@ -303,6 +363,205 @@ def _labeler(
 
 
 # ---------------------------------------------------------------------------
+# Jira (REST API v3, from the host only: its token never enters the container)
+# ---------------------------------------------------------------------------
+
+
+class JiraError(Exception):
+    """A Jira request failed; the message never contains credentials."""
+
+
+class _Jira:
+    def __init__(self, settings: CrewSettings) -> None:
+        email = os.environ.get(settings.jira_email_env, "")
+        token = os.environ.get(settings.jira_token_env, "")
+        if not settings.jira_url or not email or not token:
+            raise JiraError(
+                "Jira is not configured: set [tools.coding_crew] jira_url and the "
+                f"{settings.jira_email_env} and {settings.jira_token_env} variables."
+            )
+        self.base = settings.jira_url
+        self._auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+
+    def request(self, method: str, path: str, body: Any = None) -> Any:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            self.base + path,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": self._auth,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            raise JiraError(
+                f"Jira {method} {path.split('?')[0]}: HTTP {exc.code}"
+            ) from None
+        except (urllib.error.URLError, OSError) as exc:
+            raise JiraError(
+                f"Jira unreachable: {getattr(exc, 'reason', exc)}"
+            ) from None
+        return json.loads(raw) if raw else None
+
+    def search(self, jql: str, fields: List[str]) -> List[Dict[str, Any]]:
+        body = {"jql": jql, "fields": fields, "maxResults": 50}
+        return (self.request("POST", "/rest/api/3/search/jql", body) or {}).get(
+            "issues", []
+        )
+
+    def issue(self, key: str) -> Dict[str, Any]:
+        fields = "summary,status,labels,description,comment,issuetype,parent"
+        return self.request("GET", f"/rest/api/3/issue/{key}?fields={fields}")
+
+    def labeler(self, key: str, label: str) -> Optional[str]:
+        """Account ID of whoever added `label` most recently."""
+        account, start = None, 0
+        while True:
+            page = (
+                self.request(
+                    "GET",
+                    f"/rest/api/3/issue/{key}/changelog?startAt={start}&maxResults=100",
+                )
+                or {}
+            )
+            for history in page.get("values", []):
+                for item in history.get("items", []):
+                    if item.get("field") != "labels":
+                        continue
+                    before = str(item.get("fromString") or "").split()
+                    after = str(item.get("toString") or "").split()
+                    if label in after and label not in before:
+                        account = (history.get("author") or {}).get("accountId")
+            values = page.get("values", [])
+            if page.get("isLast", True) or not values:
+                return account
+            start += len(values)
+
+    def labels(self, key: str, add: List[str], remove: List[str]) -> None:
+        ops = [{"add": a} for a in add] + [{"remove": r} for r in remove]
+        self.request("PUT", f"/rest/api/3/issue/{key}", {"update": {"labels": ops}})
+
+    def move(self, key: str, status: str) -> bool:
+        """Moves the ticket to `status` if a transition leads there."""
+        if not status:
+            return False
+        options = (
+            self.request("GET", f"/rest/api/3/issue/{key}/transitions") or {}
+        ).get("transitions", [])
+        for option in options:
+            target = (option.get("to") or {}).get("name", "")
+            if (
+                target.lower() == status.lower()
+                or option.get("name", "").lower() == status.lower()
+            ):
+                self.request(
+                    "POST",
+                    f"/rest/api/3/issue/{key}/transitions",
+                    {"transition": {"id": option["id"]}},
+                )
+                return True
+        logger.warning("coding_crew: %s has no transition to '%s'", key, status)
+        return False
+
+    def comment(self, key: str, text: str, link: Optional[str] = None) -> None:
+        paragraphs = []
+        for line in text.split("\n"):
+            line = line.replace("**", "").strip()
+            if not line:
+                continue
+            content: List[Dict[str, Any]] = []
+            if link and link in line:
+                before, _, after = line.partition(link)
+                if before:
+                    content.append({"type": "text", "text": before})
+                content.append(
+                    {
+                        "type": "text",
+                        "text": link,
+                        "marks": [{"type": "link", "attrs": {"href": link}}],
+                    }
+                )
+                if after:
+                    content.append({"type": "text", "text": after})
+            else:
+                content.append({"type": "text", "text": line})
+            paragraphs.append({"type": "paragraph", "content": content})
+        body = {"type": "doc", "version": 1, "content": paragraphs}
+        self.request("POST", f"/rest/api/3/issue/{key}/comment", {"body": body})
+
+
+def _adf_text(node: Any) -> str:
+    """Atlassian Document Format to plain Markdown-ish text, for the agent to read."""
+    if isinstance(node, list):
+        return "".join(_adf_text(n) for n in node)
+    if not isinstance(node, dict):
+        return str(node or "")
+    kind = node.get("type")
+    inner = _adf_text(node.get("content", []))
+    attrs = node.get("attrs") or {}
+    if kind == "text":
+        text = str(node.get("text", ""))
+        marks = {m.get("type") for m in node.get("marks", []) if isinstance(m, dict)}
+        return f"`{text}`" if "code" in marks else text
+    if kind == "hardBreak":
+        return "\n"
+    if kind == "heading":
+        return "#" * int(attrs.get("level", 2) or 2) + f" {inner.strip()}\n\n"
+    if kind in ("paragraph", "blockquote", "panel"):
+        return f"{inner.strip()}\n\n"
+    if kind == "codeBlock":
+        return f"```{attrs.get('language') or ''}\n{inner}\n```\n\n"
+    if kind == "listItem":
+        return "- " + inner.strip().replace("\n", "\n  ") + "\n"
+    if kind in ("bulletList", "orderedList"):
+        return inner + "\n"
+    if kind == "mention":
+        return str(attrs.get("text") or "@someone")
+    if kind in ("inlineCard", "blockCard"):
+        return str(attrs.get("url") or "")
+    if kind == "rule":
+        return "---\n\n"
+    return inner
+
+
+def _ticket_markdown(key: str, issue: Dict[str, Any]) -> str:
+    fields = issue.get("fields") or {}
+    lines = [f"# {key}: {fields.get('summary', '')}", ""]
+    kind = (fields.get("issuetype") or {}).get("name")
+    parent = (fields.get("parent") or {}).get("key")
+    if kind:
+        lines.append(f"- Type: {kind}")
+    if parent:
+        parent_summary = ((fields.get("parent") or {}).get("fields") or {}).get(
+            "summary", ""
+        )
+        lines.append(f"- Parent: {parent} {parent_summary}".rstrip())
+    lines += [
+        "",
+        "## Description",
+        "",
+        _adf_text(fields.get("description")).strip() or "_(empty)_",
+        "",
+    ]
+    comments = ((fields.get("comment") or {}).get("comments")) or []
+    human = [
+        c for c in comments if "OpenJarvis coding crew" not in _adf_text(c.get("body"))
+    ]
+    if human:
+        lines += ["## Comments", ""]
+        for c in human[-20:]:
+            author = (c.get("author") or {}).get("displayName", "someone")
+            lines.append(f"### {author} ({str(c.get('created', ''))[:10]})")
+            lines += ["", _adf_text(c.get("body")).strip(), ""]
+    return "\n".join(lines).strip() + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -321,10 +580,11 @@ class CodingCrewQueueTool(BaseTool):
         return ToolSpec(
             name="coding_crew_queue",
             description=(
-                "List open GitHub issues that are ready for the coding crew "
-                "(labelled agent-ready, not yet claimed) in the configured "
-                "repositories, oldest first. Returns issue "
-                "references like owner/repo#12 to pass to coding_crew_run."
+                "List the tickets that are ready for the coding crew "
+                "(labelled agent-ready, not yet claimed): GitHub issues in the "
+                "configured repositories, or Jira tickets in the configured "
+                "projects, oldest first. Returns references like owner/repo#12 "
+                "or PROJ-12 to pass to coding_crew_run."
             ),
             parameters={"type": "object", "properties": {}, "required": []},
             category="vcs",
@@ -334,6 +594,8 @@ class CodingCrewQueueTool(BaseTool):
 
     def execute(self, **params: Any) -> ToolResult:
         settings = load_settings(self._config)
+        if settings.source == "jira":
+            return self._jira_queue(settings)
         if not settings.repos:
             return ToolResult(
                 tool_name=self.tool_id,
@@ -393,6 +655,52 @@ class CodingCrewQueueTool(BaseTool):
             metadata={"count": len(ready)},
         )
 
+    def _jira_queue(self, settings: CrewSettings) -> ToolResult:
+        if not settings.jira_projects:
+            return ToolResult(
+                tool_name=self.tool_id,
+                content=(
+                    "No Jira projects configured. Set [tools.coding_crew] "
+                    'jira_projects = "KEY=owner/repo" in config.toml.'
+                ),
+                success=False,
+            )
+        try:
+            jira = _Jira(settings)
+            jql = (
+                f"project in ({', '.join(sorted(settings.jira_projects))}) "
+                f"AND labels = {json.dumps(settings.label)} "
+                "AND statusCategory != Done ORDER BY created ASC"
+            )
+            issues = jira.search(jql, ["summary", "labels", "created"])
+        except JiraError as exc:
+            return ToolResult(
+                tool_name=self.tool_id,
+                content=json.dumps({"ready": [], "errors": [str(exc)]}),
+                success=False,
+            )
+        ready = []
+        for issue in issues:
+            fields = issue.get("fields") or {}
+            key = str(issue.get("key", ""))
+            if not _JIRA_KEY.match(key) or _blocking_labels(settings) & set(
+                fields.get("labels") or []
+            ):
+                continue
+            ready.append(
+                {
+                    "ref": key,
+                    "title": str(fields.get("summary", ""))[:200],
+                    "created_at": fields.get("created", ""),
+                }
+            )
+        return ToolResult(
+            tool_name=self.tool_id,
+            content=json.dumps({"ready": ready, "errors": []}, ensure_ascii=False),
+            success=True,
+            metadata={"count": len(ready)},
+        )
+
 
 @ToolRegistry.register("coding_crew_run")
 class CodingCrewRunTool(BaseTool):
@@ -409,7 +717,8 @@ class CodingCrewRunTool(BaseTool):
         return ToolSpec(
             name="coding_crew_run",
             description=(
-                "Hand one issue returned by coding_crew_queue (e.g. owner/repo#12) "
+                "Hand one ticket returned by coding_crew_queue (e.g. owner/repo#12 "
+                "or PROJ-12) "
                 "to the coding crew: it is claimed, solved by a coding agent in a "
                 "disposable container, published as a draft pull request, and "
                 "labelled with the result. Returns the outcome and the pull request "
@@ -422,7 +731,7 @@ class CodingCrewRunTool(BaseTool):
                         "type": "string",
                         "description": (
                             "Issue reference exactly as returned by "
-                            "coding_crew_queue, e.g. owner/repo#12."
+                            "coding_crew_queue, e.g. owner/repo#12 or PROJ-12."
                         ),
                     }
                 },
@@ -440,8 +749,13 @@ class CodingCrewRunTool(BaseTool):
             return self._result(
                 "busy", "Another coding crew run is in progress; try again next tick."
             )
+        ref = str(params.get("issue", ""))
         try:
-            return self._run(str(params.get("issue", "")))
+            if load_settings(self._config).source == "jira":
+                return self._run_jira(ref)
+            return self._run(ref)
+        except JiraError as exc:
+            return self._result("error", str(exc))
         except (OSError, subprocess.TimeoutExpired) as exc:
             return self._result(
                 "error", f"GitHub CLI unavailable or not responding: {exc}"
@@ -542,9 +856,15 @@ class CodingCrewRunTool(BaseTool):
                 out.chmod(
                     0o777
                 )  # the container user writes here; the parent is private
-                run = self._container(settings, repo, number, out)
+                prompt = settings.prompt.replace("{issue}", str(number)).replace(
+                    "{repo}", repo
+                )
+                run = self._container(settings, repo, str(number), out, prompt)
                 if run.get("outcome") == "committed":
-                    run = self._publish(settings, repo, number, issue, out, run)
+                    title = f"#{number}: {str(issue.get('title', '')).strip()[:200]}"
+                    run = self._publish(
+                        settings, repo, str(number), title, f"Refs #{number}", out, run
+                    )
         except Exception as exc:  # never leave the issue stuck in agent-working
             logger.exception("coding_crew: run for %s failed", ref)
             run = {"outcome": "error", "detail": f"{type(exc).__name__}: {exc}"}
@@ -568,6 +888,146 @@ class CodingCrewRunTool(BaseTool):
             turns=run.get("turns"),
             minutes=minutes,
         )
+
+    def _run_jira(self, ref: str) -> ToolResult:
+        settings = load_settings(self._config)
+        match = _JIRA_KEY.match(ref)
+        if not match:
+            return self._result("invalid", f"'{ref}' is not a Jira key like PROJ-12.")
+        key = f"{match.group(1)}-{match.group(2)}"
+        repo = settings.jira_projects.get(match.group(1))
+        if not repo:
+            return self._result(
+                "not-allowed",
+                f"{match.group(1)} is not in [tools.coding_crew] jira_projects.",
+            )
+        if not settings.jira_trusted_accounts:
+            return self._result(
+                "not-configured",
+                "Set [tools.coding_crew] jira_trusted_accounts: the Jira account IDs "
+                "allowed to hand tickets to the crew.",
+            )
+        missing = [n for n in settings.env_passthrough if not os.environ.get(n)]
+        if missing:
+            return self._result(
+                "not-configured",
+                "Missing environment variables for the container: "
+                f"{', '.join(missing)}.",
+            )
+        try:
+            jira = _Jira(settings)
+        except JiraError as exc:
+            return self._result("not-configured", str(exc))
+
+        issue = jira.issue(key)
+        fields = issue.get("fields") or {}
+        labels = set(fields.get("labels") or [])
+        category = ((fields.get("status") or {}).get("statusCategory") or {}).get("key")
+        if category == "done" or settings.label not in labels:
+            return self._result(
+                "not-ready", f"{key} is not open with the '{settings.label}' label."
+            )
+        if _blocking_labels(settings) & labels:
+            return self._result(
+                "not-ready",
+                f"{key} is already claimed or finished "
+                f"({', '.join(sorted(_blocking_labels(settings) & labels))}).",
+            )
+
+        labeler = jira.labeler(key, settings.label)
+        if labeler not in settings.jira_trusted_accounts:
+            self._finish_jira(settings, jira, key, {"outcome": "untrusted"}, 0.0)
+            return self._result(
+                "untrusted",
+                f"{key}: the '{settings.label}' label was added by "
+                f"{labeler or 'an unknown account'}, which is not in "
+                "jira_trusted_accounts.",
+            )
+
+        jira.labels(key, add=[settings.working_label], remove=[])
+        jira.move(key, settings.jira_status_working)
+        started = time.time()
+        run: Dict[str, Any] = {"outcome": "error"}
+        try:
+            with tempfile.TemporaryDirectory(prefix="oj-crew-") as scratch:
+                out = Path(scratch) / "out"
+                out.mkdir()
+                out.chmod(0o777)
+                ticket = out / "ticket.md"
+                ticket.write_text(_ticket_markdown(key, issue), encoding="utf-8")
+                ticket.chmod(0o644)
+                prompt = (
+                    settings.jira_prompt.replace("{key}", key)
+                    .replace("{issue}", key)
+                    .replace("{ticket_file}", "/out/ticket.md")
+                    .replace("{repo}", repo)
+                )
+                run = self._container(settings, repo, key, out, prompt)
+                if run.get("outcome") == "committed":
+                    summary = str(fields.get("summary", "")).strip()[:200]
+                    run = self._publish(
+                        settings,
+                        repo,
+                        key,
+                        f"{key}: {summary}",
+                        f"Jira: {settings.jira_url}/browse/{key}",
+                        out,
+                        run,
+                    )
+        except Exception as exc:  # never leave the ticket stuck in progress
+            logger.exception("coding_crew: run for %s failed", key)
+            run = {"outcome": "error", "detail": f"{type(exc).__name__}: {exc}"}
+        finally:
+            minutes = round((time.time() - started) / 60, 1)
+            self._finish_jira(settings, jira, key, run, minutes)
+
+        pr_url = run.get("pr_url")
+        outcome = "pr" if pr_url else run.get("outcome", "error")
+        return self._result(
+            outcome,
+            f"Draft pull request opened for {key}: {pr_url}"
+            if pr_url
+            else f"No pull request for {key}: "
+            f"{run.get('detail') or _PUBLIC_REASON.get(outcome, outcome)}",
+            success=bool(pr_url),
+            ref=key,
+            repo=repo,
+            pr_url=pr_url,
+            branches=run.get("branches", []),
+            cost_usd=run.get("cost_usd"),
+            turns=run.get("turns"),
+            minutes=minutes,
+        )
+
+    def _finish_jira(
+        self,
+        settings: CrewSettings,
+        jira: "_Jira",
+        key: str,
+        run: Dict[str, Any],
+        minutes: float,
+    ) -> None:
+        """Each step on its own: one Jira error must not skip the others."""
+        pr_url = run.get("pr_url")
+        steps = [
+            lambda: jira.labels(
+                key,
+                add=[settings.done_label if pr_url else settings.failed_label],
+                remove=[settings.working_label, settings.label],
+            ),
+            lambda: jira.move(
+                key,
+                settings.jira_status_review if pr_url else settings.jira_status_failed,
+            ),
+        ]
+        if settings.comment:
+            text = self._comment(run, minutes, source="jira")
+            steps.append(lambda: jira.comment(key, text, link=pr_url))
+        for step in steps:
+            try:
+                step()
+            except JiraError as exc:
+                logger.warning("coding_crew: Jira update of %s failed: %s", key, exc)
 
     def _finish(
         self,
@@ -600,12 +1060,17 @@ class CodingCrewRunTool(BaseTool):
     # -- the container -------------------------------------------------------
 
     def _docker_args(
-        self, settings: CrewSettings, repo: str, number: int, name: str, out: Path
+        self,
+        settings: CrewSettings,
+        repo: str,
+        issue_id: str,
+        name: str,
+        out: Path,
+        prompt: str,
     ) -> List[str]:
-        prompt = settings.prompt.replace("{issue}", str(number)).replace("{repo}", repo)
         env = {
             "CREW_REPO": repo,
-            "CREW_ISSUE": str(number),
+            "CREW_ISSUE": issue_id,
             "CREW_PROMPT": prompt,
             "CREW_BUDGET_USD": str(settings.budget_usd),
             "CREW_MODEL": settings.model,
@@ -644,19 +1109,20 @@ class CodingCrewRunTool(BaseTool):
     @staticmethod
     def _container_env(settings: CrewSettings) -> Dict[str, str]:
         """The docker client's environment: no write token, read token as GH_TOKEN."""
-        env = {k: v for k, v in os.environ.items() if k not in _WRITE_TOKENS}
+        hidden = _WRITE_TOKENS | {settings.jira_email_env, settings.jira_token_env}
+        env = {k: v for k, v in os.environ.items() if k not in hidden}
         if settings.read_token_env and os.environ.get(settings.read_token_env):
             env["GH_TOKEN"] = os.environ[settings.read_token_env]
         return env
 
     def _container(
-        self, settings: CrewSettings, repo: str, number: int, out: Path
+        self, settings: CrewSettings, repo: str, issue_id: str, out: Path, prompt: str
     ) -> Dict[str, Any]:
-        slug = re.sub(r"[^a-z0-9]+", "-", repo.lower())
-        name = f"oj-crew-{slug}-{number}-{int(time.time())}"
+        slug = re.sub(r"[^a-z0-9]+", "-", f"{repo}-{issue_id}".lower())
+        name = f"oj-crew-{slug}-{int(time.time())}"
         try:
             proc = subprocess.run(
-                self._docker_args(settings, repo, number, name, out),
+                self._docker_args(settings, repo, issue_id, name, out, prompt),
                 capture_output=True,
                 text=True,
                 timeout=settings.timeout_minutes * 60,
@@ -806,8 +1272,9 @@ class CodingCrewRunTool(BaseTool):
         self,
         settings: CrewSettings,
         repo: str,
-        number: int,
-        issue: Dict[str, Any],
+        issue_id: str,
+        title: str,
+        refs: str,
         out: Path,
         run: Dict[str, Any],
     ) -> Dict[str, Any]:
@@ -904,10 +1371,14 @@ class CodingCrewRunTool(BaseTool):
             return failed("no agent branch could be pushed")
 
         head = next(
-            (b for b in pushed if re.search(rf"(^|[/-]){number}([/-]|$)", b)), pushed[0]
+            (
+                b
+                for b in pushed
+                if re.search(rf"(^|[/-]){re.escape(issue_id)}([/-]|$)", b)
+            ),
+            pushed[0],
         )
-        body = self._pr_body(out, repo, number)
-        title = f"#{number}: {str(issue.get('title', '')).strip()[:200]}".strip()
+        body = self._pr_body(out, issue_id, refs)
         pr = _gh(
             settings,
             [
@@ -921,7 +1392,7 @@ class CodingCrewRunTool(BaseTool):
                 "--head",
                 head,
                 "--title",
-                title,
+                title.strip()[:240],
                 "--body-file",
                 "-",
             ],
@@ -947,9 +1418,10 @@ class CodingCrewRunTool(BaseTool):
         return {**run, "outcome": "pr", "branches": pushed, "pr_url": pr_url}
 
     @staticmethod
-    def _pr_body(out: Path, repo: str, number: int) -> str:
+    def _pr_body(out: Path, issue_id: str, refs: str) -> str:
+        label = f"#{issue_id}" if issue_id.isdigit() else issue_id
         header = (
-            f"Opened by the OpenJarvis coding crew for #{number}. "
+            f"Opened by the OpenJarvis coding crew for {label}. "
             "The description below was written by the coding agent: "
             "review the diff before merging.\n\n"
         )
@@ -962,11 +1434,11 @@ class CodingCrewRunTool(BaseTool):
         return (
             header
             + (text.strip() or "_The agent did not write a description._")
-            + f"\n\nRefs #{number}\n"
+            + f"\n\n{refs}\n"
         )
 
     @staticmethod
-    def _comment(run: Dict[str, Any], minutes: float) -> str:
+    def _comment(run: Dict[str, Any], minutes: float, source: str = "github") -> str:
         """Fixed messages and validated values only: no agent or container text."""
         lines = ["**OpenJarvis coding crew**", ""]
         if run.get("pr_url"):
@@ -978,10 +1450,16 @@ class CodingCrewRunTool(BaseTool):
             reason = _PUBLIC_REASON.get(
                 str(run.get("outcome")), _PUBLIC_REASON["error"]
             )
+            if source == "jira" and run.get("outcome") == "untrusted":
+                reason = (
+                    "the ready label was added by an account the crew does not trust"
+                )
             lines.append(f"No pull request this time: {reason}.")
             if run.get("outcome") == "untrusted":
                 lines.append(
-                    "Someone with write access must add the ready label "
+                    "Someone the crew trusts must add the ready label for it to start."
+                    if source == "jira"
+                    else "Someone with write access must add the ready label "
                     "for the crew to start."
                 )
             else:
