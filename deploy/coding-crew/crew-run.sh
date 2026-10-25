@@ -32,7 +32,9 @@ if [ -n "${GH_TOKEN:-}" ]; then
   gh auth setup-git >/dev/null 2>&1 || fail config "gh could not set up git credentials"
 fi
 clone_url="${CREW_CLONE_URL:-https://github.com/${CREW_REPO}.git}"
-git clone --quiet "${clone_url}" "${workdir}/repo" >/dev/null 2>&1 || fail clone-failed "could not clone ${CREW_REPO}"
+if ! clone_err="$(git clone --quiet "${clone_url}" "${workdir}/repo" 2>&1 >/dev/null)"; then
+  fail clone-failed "could not clone ${CREW_REPO}: $(printf '%s' "${clone_err}" | tail -n 2 | tr '\n' ' ' | cut -c1-300)"
+fi
 cd "${workdir}/repo" || fail clone-failed "clone folder missing"
 git config user.name "openjarvis-coding-crew"
 git config user.email "coding-crew@users.noreply.github.com"
