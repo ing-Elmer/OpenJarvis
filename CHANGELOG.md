@@ -10,6 +10,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**Coding crew** — label a GitHub issue `agent-ready` and come back to a draft
+pull request. The new `coding_crew` operator (every 15 minutes, local model)
+picks the oldest ready issue with `coding_crew_queue` and hands it to
+`coding_crew_run`, which runs a coding agent — Claude Code with the Cuadrilla
+kit by default, any agent works — in a disposable, hardened container
+(`deploy/coding-crew/`), then publishes its commits as an `agent/*` branch and a
+draft PR and labels the issue `agent-done` or `agent-failed`. No token that can
+write to GitHub ever enters the container: the agent's commits come back as a
+git bundle that the host imports into a fresh repository and pushes with its
+own `gh` login. Only issues labelled by someone with write access are run, the
+image is local-only (`--pull never`), and public comments carry fixed messages
+only. Configure it under `[tools.coding_crew]`; see
+`docs/user-guide/coding-crew.md`.
+
 **Apple Foundation Models (AFM 3)** — a new in-process `afm` engine drives
 Apple's `apple-fm-sdk` directly, with no HTTP hop and no second process whose
 CPU draw would land inside the same energy measurement window. Install with

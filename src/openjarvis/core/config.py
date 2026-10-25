@@ -1118,6 +1118,42 @@ class WeatherToolConfig:
 
 
 @dataclass(slots=True)
+class CodingCrewConfig:
+    """Coding crew tools: GitHub issues solved by a coding agent in a container.
+
+    Credentials stay out of config.toml: ``env_passthrough`` and ``read_token_env``
+    name environment variables, never hold their values. No token that can write to
+    GitHub ever enters the container: the host pushes the agent's commits with its
+    own ``gh`` login.
+    """
+
+    repos: str = ""  # comma-separated allowlist, e.g. "owner/app,owner/api"
+    label: str = "agent-ready"
+    working_label: str = "agent-working"
+    done_label: str = "agent-done"
+    failed_label: str = "agent-failed"
+    # Who may hand an issue to the crew: GitHub permission of whoever added `label`.
+    trusted_permissions: str = "admin,maintain,write"
+    image: str = "openjarvis-coding-crew:local"  # local only: never pulled
+    prompt: str = "/cuadrilla:ticket #{issue}"
+    branch_prefix: str = "agent/"
+    unattended_env: str = "CUADRILLA_UNATTENDED=1"
+    env_passthrough: str = "ANTHROPIC_API_KEY"  # names; GitHub tokens are refused
+    read_token_env: str = "GH_READ_TOKEN"  # optional read-only token, as GH_TOKEN
+    model: str = ""
+    budget_usd: float = 5.0
+    timeout_minutes: int = 45
+    memory: str = "4g"
+    cpus: str = "2"
+    max_bundle_mb: int = 200
+    comment: bool = True
+    push_url: str = "https://github.com/{repo}.git"
+    docker_bin: str = "docker"
+    gh_bin: str = "gh"
+    git_bin: str = "git"
+
+
+@dataclass(slots=True)
 class ToolsConfig:
     """Tools primitive settings — wraps storage and MCP configuration."""
 
@@ -1125,6 +1161,7 @@ class ToolsConfig:
     mcp: MCPConfig = field(default_factory=MCPConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     weather: WeatherToolConfig = field(default_factory=WeatherToolConfig)
+    coding_crew: CodingCrewConfig = field(default_factory=CodingCrewConfig)
     enabled: str = ""  # comma-separated default tools
 
 
@@ -2321,6 +2358,15 @@ enabled = true
 # units = "metric"             # metric or imperial
 # lang = "en"                  # OpenWeatherMap language code
 
+# Coding crew: GitHub issues labelled "agent-ready" solved in a container.
+# See docs/user-guide/coding-crew.md. Credentials stay in the environment.
+# [tools.coding_crew]
+# repos = "owner/repo"          # allowlist: the only repositories it may touch
+# image = "openjarvis-coding-crew:local"
+# prompt = "/cuadrilla:ticket #{{issue}}"
+# budget_usd = 5.0
+# timeout_minutes = 45
+
 [server]
 # Loopback is safe for local use and works without API authentication.
 host = "127.0.0.1"
@@ -2510,6 +2556,7 @@ __all__ = [
     "WebChatChannelConfig",
     "WebhookChannelConfig",
     "WeatherToolConfig",
+    "CodingCrewConfig",
     "WhatsAppBaileysChannelConfig",
     "WhatsAppChannelConfig",
     "WorkflowConfig",

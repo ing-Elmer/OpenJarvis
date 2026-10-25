@@ -118,6 +118,11 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.coding_crew  # noqa: F401
+except ImportError:
+    pass
+
+try:
     import openjarvis.tools.db_query  # noqa: F401
 except ImportError:
     pass

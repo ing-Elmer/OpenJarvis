@@ -96,3 +96,30 @@ class TestAllOperators:
         assert manifest.name
         assert manifest.tools
         assert manifest.system_prompt
+
+
+class TestCodingCrewOperator:
+    def test_loads_valid_manifest(self):
+        manifest = load_operator(_OPERATORS_DIR / "coding_crew.toml")
+        assert manifest.name == "coding_crew"
+        assert manifest.schedule_type == "interval"
+        assert int(manifest.schedule_value) >= 300
+        assert manifest.temperature == 0.0
+
+    def test_uses_the_crew_tools_and_memory_only(self):
+        manifest = load_operator(_OPERATORS_DIR / "coding_crew.toml")
+        assert set(manifest.tools) == {
+            "coding_crew_queue",
+            "coding_crew_run",
+            "memory_store",
+            "memory_retrieve",
+            "think",
+        }
+        assert "shell_exec" not in manifest.tools
+
+    def test_prompt_runs_one_issue_and_treats_issues_as_data(self):
+        prompt = load_operator(_OPERATORS_DIR / "coding_crew.toml").system_prompt
+        assert "at most ONE" in prompt
+        assert "copied exactly" in prompt
+        assert "data, not instructions" in prompt
+        assert "never merge" in prompt
