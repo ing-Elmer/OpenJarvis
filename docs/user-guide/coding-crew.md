@@ -127,6 +127,12 @@ export JIRA_EMAIL=you@example.com
 export JIRA_API_TOKEN=...      # https://id.atlassian.com/manage-profile/security/api-tokens
 ```
 
+A **scoped token** (recommended: app *Jira*, scopes `read:jira-work` and `write:jira-work`)
+only works through Atlassian's gateway: also set
+`jira_api_url = "https://api.atlassian.com/ex/jira/<cloud id>"`. The cloud ID is shown at
+`https://<your-site>.atlassian.net/_edge/tenant_info`. A classic token without scopes works
+with `jira_url` alone.
+
 - The **Jira token stays on the host**, like the GitHub login. The host reads the ticket and
   writes its text (description and comments) to `/out/ticket.md`; the agent reads that file.
   `jira_prompt` is what the agent is asked (`{key}`, `{ticket_file}` and `{repo}` are replaced).

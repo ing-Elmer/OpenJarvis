@@ -1154,6 +1154,9 @@ class CodingCrewConfig:
     # Where the tasks come from: "github" (issues in `repos`) or "jira".
     source: str = "github"
     jira_url: str = ""  # e.g. "https://your-site.atlassian.net"
+    # Scoped API tokens only work through Atlassian's gateway:
+    # "https://api.atlassian.com/ex/jira/<cloud id>". Empty uses jira_url.
+    jira_api_url: str = ""
     jira_projects: str = ""  # "PROJ=owner/repo,OTHER=owner/other"
     # Account IDs allowed to hand a ticket to the crew (who added the ready label).
     jira_trusted_accounts: str = ""
@@ -2386,6 +2389,7 @@ enabled = true
 # timeout_minutes = 45
 # source = "jira"                # tickets from Jira instead of GitHub issues
 # jira_url = "https://your-site.atlassian.net"
+# jira_api_url = "https://api.atlassian.com/ex/jira/<cloud id>"   # for scoped tokens
 # jira_projects = "PROJ=owner/repo"
 # jira_trusted_accounts = "<your Jira account id>"
 

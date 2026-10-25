@@ -128,6 +128,7 @@ class CrewSettings:
     git_bin: str
     source: str
     jira_url: str
+    jira_api_url: str
     jira_projects: Dict[str, str]
     jira_trusted_accounts: List[str]
     jira_email_env: str
@@ -186,6 +187,13 @@ def load_settings(config: Any = None) -> CrewSettings:
         r"^(https://[A-Za-z0-9.-]+|http://(127\.0\.0\.1|localhost)(:\d+)?)$", jira_url
     ):
         jira_url = ""
+    jira_api_url = str(get("jira_api_url", "") or "").rstrip("/")
+    if not re.match(
+        r"^(https://api\.atlassian\.com/ex/jira/[0-9a-f-]{36}"
+        r"|http://(127\.0\.0\.1|localhost)(:\d+)?)$",
+        jira_api_url,
+    ):
+        jira_api_url = ""
     env_name = lambda value, default: (  # noqa: E731
         str(value) if _ENV_NAME.match(str(value or "")) else default
     )
@@ -228,6 +236,7 @@ def load_settings(config: Any = None) -> CrewSettings:
         git_bin=str(get("git_bin", "git")),
         source="jira" if str(get("source", "github")).lower() == "jira" else "github",
         jira_url=jira_url,
+        jira_api_url=jira_api_url,
         jira_projects=jira_projects,
         jira_trusted_accounts=_split(get("jira_trusted_accounts", "")),
         jira_email_env=env_name(get("jira_email_env", "JIRA_EMAIL"), "JIRA_EMAIL"),
@@ -380,7 +389,7 @@ class _Jira:
                 "Jira is not configured: set [tools.coding_crew] jira_url and the "
                 f"{settings.jira_email_env} and {settings.jira_token_env} variables."
             )
-        self.base = settings.jira_url
+        self.base = settings.jira_api_url or settings.jira_url
         self._auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
 
     def request(self, method: str, path: str, body: Any = None) -> Any:

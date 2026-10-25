@@ -873,3 +873,20 @@ def test_jira_settings_are_validated():
     assert settings.jira_url == ""
     assert settings.jira_projects == {"SCRUM": "acme/app"}
     assert settings.env_passthrough == ["ANTHROPIC_API_KEY"]
+
+
+def test_scoped_tokens_use_the_atlassian_gateway(jira):
+    port = jira.config.jira_url.rsplit(":", 1)[1]
+    jira.config.jira_api_url = f"http://localhost:{port}"
+    jira.config.jira_url = "https://agrovision.atlassian.net"
+    _, data = jira.run("SCRUM-68")
+    assert data["outcome"] == "pr"
+    create = next(c for c in jira.gh_calls() if c["args"][:2] == ["pr", "create"])
+    assert "https://agrovision.atlassian.net/browse/SCRUM-68" in create["stdin"]
+    cloud = "3aacc152-153c-4440-ab43-17b531b1c3d5"
+    gateway = load_settings(
+        CodingCrewConfig(jira_api_url=f"https://api.atlassian.com/ex/jira/{cloud}/")
+    )
+    assert gateway.jira_api_url.endswith(cloud)
+    evil = load_settings(CodingCrewConfig(jira_api_url="https://evil.example"))
+    assert evil.jira_api_url == ""
