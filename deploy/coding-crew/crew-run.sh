@@ -77,7 +77,10 @@ if [ "${current}" = "${base_branch}" ] || [ "${current}" = "HEAD" ]; then
   fi
 fi
 if [ -n "$(git status --porcelain)" ] && [[ "${current}" == "${CREW_BRANCH_PREFIX}"* ]]; then
-  git add -A && git commit --quiet --no-verify -m "chore: changes the agent left uncommitted (${ticket})" && by_runner=true
+  message="${CREW_ISSUE}: ${CREW_TITLE:-changes left uncommitted by the agent}"
+  [ "${ticket}" = "#${CREW_ISSUE}" ] && message="${CREW_TITLE:-changes left uncommitted by the agent} (#${CREW_ISSUE})"
+  git add -A && git commit --quiet --no-verify -m "${message}" \
+    -m "Committed by the coding crew runner: the agent left these changes uncommitted." && by_runner=true
 fi
 
 branches=()

@@ -868,7 +868,14 @@ class CodingCrewRunTool(BaseTool):
                 prompt = settings.prompt.replace("{issue}", str(number)).replace(
                     "{repo}", repo
                 )
-                run = self._container(settings, repo, str(number), out, prompt)
+                run = self._container(
+                    settings,
+                    repo,
+                    str(number),
+                    out,
+                    prompt,
+                    str(issue.get("title", "")),
+                )
                 if run.get("outcome") == "committed":
                     title = f"#{number}: {str(issue.get('title', '')).strip()[:200]}"
                     run = self._publish(
@@ -971,7 +978,9 @@ class CodingCrewRunTool(BaseTool):
                     .replace("{ticket_file}", "/out/ticket.md")
                     .replace("{repo}", repo)
                 )
-                run = self._container(settings, repo, key, out, prompt)
+                run = self._container(
+                    settings, repo, key, out, prompt, str(fields.get("summary", ""))
+                )
                 if run.get("outcome") == "committed":
                     summary = str(fields.get("summary", "")).strip()[:200]
                     run = self._publish(
@@ -1076,8 +1085,10 @@ class CodingCrewRunTool(BaseTool):
         name: str,
         out: Path,
         prompt: str,
+        title: str = "",
     ) -> List[str]:
         env = {
+            "CREW_TITLE": re.sub(r"\s+", " ", title).strip()[:120],
             "CREW_REPO": repo,
             "CREW_ISSUE": issue_id,
             "CREW_PROMPT": prompt,
@@ -1125,13 +1136,19 @@ class CodingCrewRunTool(BaseTool):
         return env
 
     def _container(
-        self, settings: CrewSettings, repo: str, issue_id: str, out: Path, prompt: str
+        self,
+        settings: CrewSettings,
+        repo: str,
+        issue_id: str,
+        out: Path,
+        prompt: str,
+        title: str = "",
     ) -> Dict[str, Any]:
         slug = re.sub(r"[^a-z0-9]+", "-", f"{repo}-{issue_id}".lower())
         name = f"oj-crew-{slug}-{int(time.time())}"
         try:
             proc = subprocess.run(
-                self._docker_args(settings, repo, issue_id, name, out, prompt),
+                self._docker_args(settings, repo, issue_id, name, out, prompt, title),
                 capture_output=True,
                 text=True,
                 timeout=settings.timeout_minutes * 60,
@@ -1487,4 +1504,63 @@ class CodingCrewRunTool(BaseTool):
         return "\n".join(lines)
 
 
-__all__ = ["CodingCrewQueueTool", "CodingCrewRunTool", "CrewSettings", "load_settings"]
+_WAIT_OUTCOMES = {
+    "busy",
+    "error",
+    "invalid",
+    "not-allowed",
+    "not-configured",
+    "not-ready",
+}
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """``python -m openjarvis.tools.coding_crew [--watch MINUTES]``.
+
+    Runs the oldest ready ticket, the same way the operator does but without a model.
+    With ``--watch`` it keeps checking the queue every MINUTES until stopped.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m openjarvis.tools.coding_crew")
+    parser.add_argument(
+        "--watch",
+        type=float,
+        metavar="MINUTES",
+        help="keep checking the queue every MINUTES (one ticket at a time)",
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    while True:
+        queue = json.loads(CodingCrewQueueTool().execute().content or "{}")
+        for error in queue.get("errors", []):
+            logger.warning("queue: %s", error)
+        ready = queue.get("ready", []) if isinstance(queue, dict) else []
+        if ready:
+            ref = ready[0]["ref"]
+            logger.info("running %s: %s", ref, ready[0].get("title", ""))
+            content = CodingCrewRunTool().execute(issue=ref).content
+            print(content, flush=True)
+            outcome = json.loads(content or "{}").get("outcome")
+            # A finished ticket leaves the queue: go straight to the next one. Anything
+            # else (missing config, Jira down…) waits, so the loop never spins.
+            if args.watch is not None and outcome not in _WAIT_OUTCOMES:
+                continue
+        elif args.watch is None:
+            print(json.dumps({"outcome": "idle"}), flush=True)
+        if args.watch is None:
+            return 0
+        time.sleep(max(1.0, args.watch * 60))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
+
+
+__all__ = [
+    "CodingCrewQueueTool",
+    "CodingCrewRunTool",
+    "CrewSettings",
+    "load_settings",
+    "main",
+]

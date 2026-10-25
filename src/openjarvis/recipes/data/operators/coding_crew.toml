@@ -1,7 +1,7 @@
 [operator]
 name = "coding_crew"
 version = "0.1.0"
-description = "Picks GitHub issues labelled agent-ready and has a coding agent solve each one in a disposable container, ending in a draft pull request for a person to review"
+description = "Picks GitHub issues or Jira tickets labelled agent-ready and has a coding agent solve each one in a disposable container, ending in a draft pull request for a person to review"
 metrics = ["issues_attempted", "pull_requests_opened"]
 
 [operator.agent]

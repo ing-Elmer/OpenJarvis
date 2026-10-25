@@ -890,3 +890,22 @@ def test_scoped_tokens_use_the_atlassian_gateway(jira):
     assert gateway.jira_api_url.endswith(cloud)
     evil = load_settings(CodingCrewConfig(jira_api_url="https://evil.example"))
     assert evil.jira_api_url == ""
+
+
+def test_runner_commit_carries_the_ticket_title(jira, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "uncommitted")
+    _, data = jira.run("SCRUM-68")
+    assert data["branches"] == ["agent/SCRUM-68-crew"]
+    subject = _git(jira.origin, "log", "-1", "--format=%s", "agent/SCRUM-68-crew")
+    assert subject == "SCRUM-68: /health returns the version"
+
+
+def test_main_runs_the_oldest_ready_ticket(jira, monkeypatch, capsys):
+    monkeypatch.setattr(
+        coding_crew,
+        "load_settings",
+        lambda config=None, _l=load_settings: _l(jira.config),
+    )
+    assert coding_crew.main([]) == 0
+    printed = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert printed[-1]["ref"] == "SCRUM-68" and printed[-1]["outcome"] == "pr"

@@ -158,6 +158,14 @@ jarvis operators run coding_crew          # or one tick now
 
 Then label an issue `agent-ready`.
 
+Without a local model, the same loop runs as plain code: it takes the oldest ready ticket,
+runs it, and checks again every 15 minutes until you stop it with Ctrl+C.
+
+```bash
+uv run python -m openjarvis.tools.coding_crew              # one ticket, then exit
+uv run python -m openjarvis.tools.coding_crew --watch 15   # keep watching
+```
+
 ## Outcomes
 
 | Label | Comment on the issue | What to do |
